@@ -4,6 +4,7 @@
 
 // DEFINE
 
+#define BACKLOG 10
 #define MAX_CLIENT 1024
 #define N 64
 
@@ -26,11 +27,13 @@ typedef struct client CLIENT;
 
 // PROTOTYPE
 DWORD WINAPI CommandThread(LPVOID params);
-void concat(char** phtml, char* str);
-char* scanFiles(char* path);
 void clearClient(int idx);
 void clearSubClient(SUBCLIENT* lpsubclient);
 char* getFilePath(char* buffer, char* wd);
+void concat(char** phtml, char* str);
+char* scanFiles(char* path);
+char* pasvScanFiles(char* path);
+char* to3LetterAbbr(int month);
 
 // GLOBAL VARIABLES
 CLIENT g_clients[MAX_CLIENT] = {};
@@ -70,20 +73,20 @@ int main() {
 		exit(-1);
     }
 
-    if (listen(s, 10) == SOCKET_ERROR) {
+    if (listen(s, BACKLOG) == SOCKET_ERROR) {
         int errCode = WSAGetLastError();
         printf("Error occurs: %d", errCode);
 		exit(-1);
     }
 	
     fd_set fdread;
-    FD_ZERO(&fdread);
+    FD_ZERO(&fdread); // Initializes set to the empty set. A set should always be cleared before using
 
     while (TRUE) {
-        FD_SET(s, &fdread);
+        FD_SET(s, &fdread); // Adds socket s to set.
         select(0, &fdread, NULL, NULL, NULL);
-        if (FD_ISSET(s, &fdread)) {
-            FD_CLR(s, &fdread);
+        if (FD_ISSET(s, &fdread)) { // Checks to see if s is a member of set and returns TRUE if so.
+            FD_CLR(s, &fdread); // Removes socket s from set.
             SOCKADDR_IN saddr;
             int addrlen = sizeof(saddr);
             SOCKET cs = accept(s, (sockaddr*)&saddr, &addrlen);
@@ -158,7 +161,7 @@ DWORD WINAPI CommandThread(LPVOID params) {
 
         // trong luc treo thi rat co the g_events da duoc cap nhat --> can timeout
         // chi can co 1 invalid handle trong tap event la an loi ngay
-        int idx = WSAWaitForMultipleEvents(totalClients, g_events + startIdx, FALSE, 1000, FALSE); 
+        int idx = WSAWaitForMultipleEvents(totalClients, g_events + startIdx, FALSE, 500, FALSE); 
         if (idx == WSA_WAIT_TIMEOUT) {
             continue;
         }
@@ -254,30 +257,64 @@ DWORD WINAPI CommandThread(LPVOID params) {
                         sprintf(buffer, "200 Port command successful\r\n");
                         send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
                     }
-                    else if (strncmp(buffer, "MLSD", 4) == 0) {
+                    else if (strncmp(buffer, "MLSD", 4) == 0 || strncmp(buffer, "LIST", 4) == 0) {
                         // thong bao mo phien truyen dl o kenh lenh
                         memset(buffer, 0, sizeof(buffer));
                         sprintf(buffer, "150 Opening data channel\r\n");
                         send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
-                        if (connect(g_clients[i].actv.s, (sockaddr*)&g_clients[i].actv.saddr, sizeof(g_clients[i].actv.saddr)) == SOCKET_ERROR) {
-                            int errCode = WSAGetLastError();
-                            printf("Error occurs: %d\n", errCode);
-                            memset(buffer, 0, sizeof(buffer));
-                            sprintf(buffer, "425 Cannot open data channel\r\n");
-                            send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
-                            break;
-                        }
+                        
+                        if (g_clients[i].isActv) {
+                            if (connect(g_clients[i].actv.s, (sockaddr*)&g_clients[i].actv.saddr, sizeof(g_clients[i].actv.saddr)) == SOCKET_ERROR) {
+                                int errCode = WSAGetLastError();
+                                printf("Error occurs: %d\n", errCode);
+                                memset(buffer, 0, sizeof(buffer));
+                                sprintf(buffer, "425 Cannot open data channel\r\n");
+                                send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
+                                break;
+                            }
 
-                        // truyen dl o kenh dl
-                        char* scanRes = scanFiles(g_clients[i].wd);
-                        if (scanRes == NULL) {
-                            scanRes = (char*)calloc(3, sizeof(char)); // cap phat dong de phia duoi free()
-                            sprintf(scanRes, "\r\n");
+                            // truyen dl o kenh dl
+                            char* scanRes = scanFiles(g_clients[i].wd);
+                            if (scanRes == NULL) {
+                                scanRes = (char*)calloc(3, sizeof(char)); // cap phat dong de phia duoi free()
+                                sprintf(scanRes, "\r\n");
+                            }
+                            send(g_clients[i].actv.s, scanRes, strlen(scanRes), 0);
+                            free(scanRes); scanRes = NULL; // nho la khong free duoc "con tro hang"
+                            closesocket(g_clients[i].actv.s);
                         }
-                        send(g_clients[i].actv.s, scanRes, strlen(scanRes), 0);
-                        free(scanRes); scanRes = NULL; // nho la khong free duoc "con tro hang"
-                        closesocket(g_clients[i].actv.s);
-                        clearSubClient(&g_clients[i].actv);
+                        else {
+                            fd_set fdread;
+                            FD_ZERO(&fdread);
+                            FD_SET(g_clients[i].pasv.s, &fdread);
+                            timeval timeout;
+                            timeout.tv_sec = 1;
+                            timeout.tv_usec = 0;
+
+                            int selRes = select(0, &fdread, NULL, NULL, &timeout);
+                            if (selRes == 0 || selRes == SOCKET_ERROR) {
+                                memset(buffer, 0, sizeof(buffer));
+                                sprintf(buffer, "425 Cannot open data channel\r\n");
+                                send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
+                                closesocket(g_clients[i].pasv.s);
+                                break;
+                            }
+
+                            SOCKADDR_IN pasv_data_saddr;
+                            int pasv_data_addrlen = sizeof(pasv_data_saddr);
+                            SOCKET pasv_data_s = accept(g_clients[i].pasv.s, (sockaddr*)&pasv_data_saddr, &pasv_data_addrlen);
+
+                            // gui dl tren datasockets da accept
+                            char* scanRes = pasvScanFiles(g_clients[i].wd);
+                            if (scanRes == NULL) {
+                                scanRes = (char*)calloc(2, sizeof(char));
+                                sprintf(scanRes, "\n");
+                            }
+                            send(pasv_data_s, scanRes, strlen(scanRes), 0);
+                            free(scanRes); scanRes = NULL;
+                            closesocket(pasv_data_s);
+                            closesocket(g_clients[i].pasv.s);
+                        }
 
                         // thong bao truyen xong dl o kenh lenh
                         memset(buffer, 0, sizeof(buffer));
@@ -326,26 +363,61 @@ DWORD WINAPI CommandThread(LPVOID params) {
                         memset(buffer, 0, sizeof(buffer));
                         sprintf(buffer, "150 Opening data channel\r\n");
                         send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
-                        if (connect(g_clients[i].actv.s, (sockaddr*)&g_clients[i].actv.saddr, sizeof(g_clients[i].actv.saddr)) == SOCKET_ERROR) {
-                            int errCode = WSAGetLastError();
-                            printf("Error occurs: %d\n", errCode);
-                            memset(buffer, 0, sizeof(buffer));
-                            sprintf(buffer, "425 Cannot open data channel\r\n");
-                            send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
-                            break;
-                        }
+                        
+                        if (g_clients[i].isActv) {
+                            if (connect(g_clients[i].actv.s, (sockaddr*)&g_clients[i].actv.saddr, sizeof(g_clients[i].actv.saddr)) == SOCKET_ERROR) {
+                                int errCode = WSAGetLastError();
+                                printf("Error occurs: %d\n", errCode);
+                                memset(buffer, 0, sizeof(buffer));
+                                sprintf(buffer, "425 Cannot open data channel\r\n");
+                                send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
+                                break;
+                            }
 
-                        // truyen dl o kenh dl
-                        memset(buffer, 0, sizeof(buffer));
-                        FILE* f = fopen(fpath, "rb");
-                        while (!feof(f)) {
-                            int r = fread(buffer, sizeof(char), sizeof(buffer), f);
-                            send(g_clients[i].actv.s, buffer, r, 0);
+                            // truyen dl o kenh dl
+                            memset(buffer, 0, sizeof(buffer));
+                            FILE* f = fopen(fpath, "rb");
+                            while (!feof(f)) {
+                                int r = fread(buffer, sizeof(char), sizeof(buffer), f);
+                                send(g_clients[i].actv.s, buffer, r, 0);
+                            }
+                            fclose(f);
+                            free(fpath); fpath = NULL;
+                            closesocket(g_clients[i].actv.s);
                         }
-                        fclose(f);
-                        free(fpath); fpath = NULL;
-                        closesocket(g_clients[i].actv.s);
-                        clearSubClient(&g_clients[i].actv);
+                        else {
+                            fd_set fdread;
+                            FD_ZERO(&fdread);
+                            FD_SET(g_clients[i].pasv.s, &fdread);
+                            timeval timeout;
+                            timeout.tv_sec = 1;
+                            timeout.tv_usec = 0;
+
+                            int selRes = select(0, &fdread, NULL, NULL, &timeout);
+                            if (selRes == 0 || selRes == SOCKET_ERROR) {
+                                memset(buffer, 0, sizeof(buffer));
+                                sprintf(buffer, "425 Cannot open data channel\r\n");
+                                send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
+                                closesocket(g_clients[i].pasv.s);
+                                break;
+                            }
+
+                            SOCKADDR_IN pasv_data_saddr;
+                            int pasv_data_addrlen = sizeof(pasv_data_saddr);
+                            SOCKET pasv_data_s = accept(g_clients[i].pasv.s, (sockaddr*)&pasv_data_saddr, &pasv_data_addrlen);
+
+                            // gui dl tren datasockets da accept
+                            memset(buffer, 0, sizeof(buffer));
+                            FILE* f = fopen(fpath, "rb");
+                            while (!feof(f)) {
+                                int r = fread(buffer, sizeof(char), sizeof(buffer), f);
+                                send(pasv_data_s, buffer, r, 0);
+                            }
+                            fclose(f);
+                            free(fpath); fpath = NULL;
+                            closesocket(pasv_data_s);
+                            closesocket(g_clients[i].pasv.s);
+                        }
 
                         // thong bao truyen xong dl o kenh lenh
                         memset(buffer, 0, sizeof(buffer));
@@ -359,30 +431,71 @@ DWORD WINAPI CommandThread(LPVOID params) {
                         memset(buffer, 0, sizeof(buffer));
                         sprintf(buffer, "150 Opening data channel\r\n");
                         send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
-                        if (connect(g_clients[i].actv.s, (sockaddr*)&g_clients[i].actv.saddr, sizeof(g_clients[i].actv.saddr)) == SOCKET_ERROR) {
-                            int errCode = WSAGetLastError();
-                            printf("Error occurs: %d\n", errCode);
-                            memset(buffer, 0, sizeof(buffer));
-                            sprintf(buffer, "425 Cannot open data channel\r\n");
-                            send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
-                            break;
-                        }
-
-                        // truyen dl o kenh dl
-                        memset(buffer, 0, 1024);
-                        FILE* f = fopen(fpath, "wb");
-                        while (true) {
-                            int r = recv(g_clients[i].actv.s, buffer, sizeof(buffer), 0);
-                            if (r > 0) {
-                                fwrite(buffer, sizeof(char), r, f);
-                            }
-                            else {
+                        
+                        if (g_clients[i].isActv) {
+                            if (connect(g_clients[i].actv.s, (sockaddr*)&g_clients[i].actv.saddr, sizeof(g_clients[i].actv.saddr)) == SOCKET_ERROR) {
+                                int errCode = WSAGetLastError();
+                                printf("Error occurs: %d\n", errCode);
+                                memset(buffer, 0, sizeof(buffer));
+                                sprintf(buffer, "425 Cannot open data channel\r\n");
+                                send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
                                 break;
                             }
+
+                            // truyen dl o kenh dl
+                            memset(buffer, 0, 1024);
+                            FILE* f = fopen(fpath, "wb");
+                            while (true) {
+                                int r = recv(g_clients[i].actv.s, buffer, sizeof(buffer), 0);
+                                if (r > 0) {
+                                    fwrite(buffer, sizeof(char), r, f);
+                                }
+                                else {
+                                    break;
+                                }
+                            }
+                            fclose(f);
+                            free(fpath); fpath = NULL;
+                            closesocket(g_clients[i].actv.s);
                         }
-                        fclose(f);
-                        free(fpath); fpath = NULL;
-                        closesocket(g_clients[i].actv.s);
+                        else {
+                            fd_set fdread;
+                            FD_ZERO(&fdread);
+                            FD_SET(g_clients[i].pasv.s, &fdread);
+                            timeval timeout;
+                            timeout.tv_sec = 1;
+                            timeout.tv_usec = 0;
+
+                            int selRes = select(0, &fdread, NULL, NULL, &timeout);
+                            if (selRes == 0 || selRes == SOCKET_ERROR) {
+                                memset(buffer, 0, sizeof(buffer));
+                                sprintf(buffer, "425 Cannot open data channel\r\n");
+                                send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
+                                closesocket(g_clients[i].pasv.s);
+                                break;
+                            }
+
+                            SOCKADDR_IN pasv_data_saddr;
+                            int pasv_data_addrlen = sizeof(pasv_data_saddr);
+                            SOCKET pasv_data_s = accept(g_clients[i].pasv.s, (sockaddr*)&pasv_data_saddr, &pasv_data_addrlen);
+
+                            // gui dl tren datasockets da accept
+                            memset(buffer, 0, 1024);
+                            FILE* f = fopen(fpath, "wb");
+                            while (true) {
+                                int r = recv(pasv_data_s, buffer, sizeof(buffer), 0); // lam sao biet nhan bao nhieu?
+                                if (r > 0) {
+                                    fwrite(buffer, sizeof(char), r, f);
+                                }
+                                else {
+                                    break;
+                                }
+                            }
+                            fclose(f);
+                            free(fpath); fpath = NULL;
+                            closesocket(pasv_data_s);
+                            closesocket(g_clients[i].pasv.s);
+                        }
 
                         // thong bao truyen xong dl o kenh lenh
                         memset(buffer, 0, sizeof(buffer));
@@ -410,7 +523,68 @@ DWORD WINAPI CommandThread(LPVOID params) {
                         sprintf(buffer, "200 Ok\r\n");
                         send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
                     }
-                    else if (strncmp(buffer, "NOOP", 4)) {
+                    else if (strncmp(buffer, "PASV", 4) == 0) {
+                        // nghe o 1 cong ngau nhien
+                        SOCKET pasv_s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                        if (pasv_s == INVALID_SOCKET) {
+                            int errCode = WSAGetLastError();
+                            printf("Error occurs: %d\n", errCode);
+                            memset(buffer, 0, sizeof(buffer));
+                            sprintf(buffer, "421 PASV command failed");
+                            send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
+                            break;
+                        }
+
+                        SOCKADDR_IN pasv_addrin;
+                        pasv_addrin.sin_family = AF_INET;
+                        pasv_addrin.sin_port = htons(0); // binding to port 0
+                        pasv_addrin.sin_addr.S_un.S_addr = ADDR_ANY;
+
+                        if (bind(pasv_s, (sockaddr*)&pasv_addrin, sizeof(pasv_addrin)) == INVALID_SOCKET) {
+                            int errCode = WSAGetLastError();
+                            printf("Error occurs: %d\n", errCode);
+                            memset(buffer, 0, sizeof(buffer));
+                            sprintf(buffer, "421 PASV command failed");
+                            send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
+                            break;
+                        }
+                        //printf("%d\n", pasv_addrin.sin_port); // --> ra 0
+
+                        if (listen(pasv_s, BACKLOG) == INVALID_SOCKET) {
+                            int errCode = WSAGetLastError();
+                            printf("Error occurs: %d\n", errCode);
+                            memset(buffer, 0, sizeof(buffer));
+                            sprintf(buffer, "421 PASV command failed");
+                            send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
+                            break;
+                        }
+
+                        int pasv_namelen = sizeof(pasv_addrin);
+                        getsockname(pasv_s, (sockaddr*)&pasv_addrin, &pasv_namelen);
+                        //printf("%d\n", pasv_addrin.sin_port); // --> ra 1 so khac 0
+
+                        int ip1 = 127;
+                        int ip2 = 0;
+                        int ip3 = 0;
+                        int ip4 = 1;
+                        WORD pasv_port = ntohs(pasv_addrin.sin_port);
+                        int p1 = pasv_port >> 8;
+                        int p2 = pasv_port & 0x00FF;
+                        
+                        g_clients[i].isActv = FALSE;
+                        g_clients[i].pasv.s = pasv_s;
+                        g_clients[i].pasv.saddr.sin_family = AF_INET;
+                        g_clients[i].pasv.saddr.sin_addr.S_un.S_un_b.s_b1 = ip1;
+                        g_clients[i].pasv.saddr.sin_addr.S_un.S_un_b.s_b2 = ip2;
+                        g_clients[i].pasv.saddr.sin_addr.S_un.S_un_b.s_b3 = ip3;
+                        g_clients[i].pasv.saddr.sin_addr.S_un.S_un_b.s_b4 = ip4;
+                        g_clients[i].pasv.saddr.sin_port = pasv_addrin.sin_port;
+
+                        memset(buffer, 0, sizeof(buffer));
+                        sprintf(buffer, "227 Entering Passive Mode (%d,%d,%d,%d,%d,%d)\r\n", ip1, ip2, ip3, ip4, p1, p2);
+                        send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
+                    }
+                    else if (strncmp(buffer, "NOOP", 4) == 0) {
                         memset(buffer, 0, sizeof(buffer));
                         sprintf(buffer, "200 Ok\r\n");
                         send(g_clients[i].cmd.s, buffer, strlen(buffer), 0);
@@ -425,6 +599,28 @@ DWORD WINAPI CommandThread(LPVOID params) {
         }
     }
     return 0;
+}
+
+void clearClient(int idx) {
+    clearSubClient(&g_clients[idx].cmd);
+    clearSubClient(&g_clients[idx].actv);
+    clearSubClient(&g_clients[idx].pasv);
+    g_events[idx] = INVALID_HANDLE_VALUE;
+}
+
+void clearSubClient(SUBCLIENT* lpsubclient) {
+    memset(lpsubclient, 0, sizeof(SUBCLIENT));
+    lpsubclient->s = INVALID_SOCKET;
+}
+
+char* getFilePath(char* buffer, char* wd) {
+    char* fname = buffer + 5;
+    while (fname[strlen(fname) - 1] == '\r' || fname[strlen(fname) - 1] == '\n') {
+        fname[strlen(fname) - 1] = '\0';
+    }
+    char* fpath = (char*)calloc(1024, sizeof(char));
+    sprintf(fpath, "C:%s/%s", wd, fname);
+    return fpath;
 }
 
 void concat(char** phtml, char* str) {
@@ -484,24 +680,103 @@ char* scanFiles(char* path) {
     return res;
 }
 
-void clearClient(int idx) {
-    clearSubClient(&g_clients[idx].cmd);
-    clearSubClient(&g_clients[idx].actv);
-    clearSubClient(&g_clients[idx].pasv);
-    g_events[idx] = INVALID_HANDLE_VALUE;
-}
-
-void clearSubClient(SUBCLIENT* lpsubclient) {
-    memset(lpsubclient, 0, sizeof(SUBCLIENT));
-    lpsubclient->s = INVALID_SOCKET;
-}
-
-char* getFilePath(char* buffer, char* wd) {
-    char* fname = buffer + 5;
-    while (fname[strlen(fname) - 1] == '\r' || fname[strlen(fname) - 1] == '\n') {
-        fname[strlen(fname) - 1] = '\0';
+char* pasvScanFiles(char* path) {
+    char* res = NULL;
+    char oneline[1024];
+    // sanitize path
+    char findPath[1024] = {};
+    if (strcmp(path, "/") == 0)
+    {
+        sprintf(findPath, "C:/*.*"); // if folder == "/" ==> findPath == C:/*.*
     }
-    char* fpath = (char*)calloc(1024, sizeof(char));
-    sprintf(fpath, "C:%s/%s", wd, fname);
-    return fpath;
+    else
+    {
+        sprintf(findPath, "C:%s/*.*", path); // if folder == "/tmp" ==> findPath == C:/tmp/*.*
+    }
+
+    WIN32_FIND_DATAA findData;
+    HANDLE hFind = FindFirstFileA(findPath, &findData);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            sprintf(oneline, "drwxrwxr-- ftp ftp");
+        }
+        else {
+            sprintf(oneline, "-rwxrwxr-- ftp ftp");
+        }
+        DWORD fileSizeHigh = findData.nFileSizeHigh;
+        DWORD fileSizeLow = findData.nFileSizeLow;
+        UINT64 fileSize = ((fileSizeHigh << 32) | fileSizeLow);
+        sprintf(oneline + strlen(oneline), " %-14llu", fileSize);
+        FILETIME fileTime = findData.ftLastWriteTime;
+        SYSTEMTIME systemTime;
+        FileTimeToSystemTime(&fileTime, &systemTime);
+        sprintf(oneline + strlen(oneline), "%s %02d %02d:%02d", to3LetterAbbr(systemTime.wMonth), systemTime.wDay, systemTime.wHour, systemTime.wMinute);
+        sprintf(oneline + strlen(oneline), "; %s\n", findData.cFileName);
+        concat(&res, oneline);
+        while (FindNextFileA(hFind, &findData)) {
+            memset(oneline, 0, sizeof(oneline));
+            if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                sprintf(oneline, "drwxrwxr-- ftp ftp");
+            }
+            else {
+                sprintf(oneline, "-rwxrwxr-- ftp ftp");
+            }
+            DWORD fileSizeHigh = findData.nFileSizeHigh;
+            DWORD fileSizeLow = findData.nFileSizeLow;
+            UINT64 fileSize = ((fileSizeHigh << 32) | fileSizeLow);
+            sprintf(oneline + strlen(oneline), " %-14llu", fileSize);
+            FILETIME fileTime = findData.ftLastWriteTime;
+            SYSTEMTIME systemTime;
+            FileTimeToSystemTime(&fileTime, &systemTime);
+            sprintf(oneline + strlen(oneline), "%s %02d %02d:%02d", to3LetterAbbr(systemTime.wMonth), systemTime.wDay, systemTime.wHour, systemTime.wMinute);
+            sprintf(oneline + strlen(oneline), "; %s\n", findData.cFileName);
+            concat(&res, oneline);
+        }
+    }
+    return res;
+}
+
+char* to3LetterAbbr(int month) {
+    char* res;
+    switch (month) {
+    case 1:
+        res = (char*)"Jan";
+        break;
+    case 2:
+        res = (char*)"Feb";
+        break;
+    case 3:
+        res = (char*)"Mar";
+        break;
+    case 4:
+        res = (char*)"Apr";
+        break;
+    case 5:
+        res = (char*)"May";
+        break;
+    case 6:
+        res = (char*)"Jun";
+        break;
+    case 7:
+        res = (char*)"Jul";
+        break;
+    case 8:
+        res = (char*)"Aug";
+        break;
+    case 9:
+        res = (char*)"Sep";
+        break;
+    case 10:
+        res = (char*)"Oct";
+        break;
+    case 11:
+        res = (char*)"Nov";
+        break;
+    case 12:
+        res = (char*)"Dec";
+        break;
+    default:
+        break;
+    }
+    return res;
 }
